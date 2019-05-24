@@ -260,7 +260,7 @@ class SnmpSync(params: SnmpParams) {
           val v = vb.getVariable
 
           // Fix this patch right.get:
-          VarBind(obj(o.last), cast(obj, v).right.get)
+          VarBind(obj(o drop obj.oid.length), cast(obj, v).right.get)
         }
 
         Right(vbs)
