@@ -9,13 +9,17 @@
 
 package org.snmp4s
 
-import org.snmp4j.{Snmp => Snmp4j, CommunityTarget, PDU}
-import org.snmp4j.smi.{GenericAddress, OctetString, VariableBinding, OID, Integer32, Variable}
+import org.snmp4j.{CommunityTarget, PDU, ScopedPDU, Target, UserTarget, Snmp => Snmp4j}
+import org.snmp4j.smi.{GenericAddress, Integer32, OID, OctetString, Variable, VariableBinding}
 import org.snmp4j.transport.DefaultUdpTransportMapping
 import org.snmp4j.util.TreeUtils
 import org.snmp4j.util.DefaultPDUFactory
+
 import scala.collection.JavaConversions._
 import Mib._
+import org.snmp4j.mp.MPv3
+import org.snmp4j.security.{SecurityLevel, SecurityModels, SecurityProtocols, USM, UsmUser}
+import org.snmp4s.SnmpParams.{Op, Read, Write}
 
 sealed trait SnmpError
 
@@ -103,19 +107,50 @@ case class SnmpParams(
                        write: String = "private",
                        version: Version = Version1,
                        retries: Int = 2,
-                       timeout: Long = 1500) {
+                       timeout: Long = 1500,
+                       authProtocol: Option[OID] = None,
+                       privProtocol: Option[OID] = None,
+                       authPass: Option[String] = None,
+                       privPass: Option[String] = None,
+                       username: Option[String] = None) {
 
   private val addr = GenericAddress.parse(s"udp:$ip/$port")
 
-  def target(comm: String) = {
-    val target = new CommunityTarget
-    target.setCommunity(new OctetString(read))
+  def target(op: Op): Target = {
+    val target = version match {
+      case Version1 | Version2c =>
+        val t = new CommunityTarget
+        t.setCommunity(new OctetString(op match {
+          case SnmpParams.Read => read
+          case SnmpParams.Write => write
+        }))
+        t
+      case Version3 =>
+        val t = new UserTarget()
+        authPass match {
+          case Some(_) => privPass match {
+            case Some(_) => t.setSecurityLevel(SecurityLevel.AUTH_PRIV)
+            case None => t.setSecurityLevel(SecurityLevel.AUTH_NOPRIV)
+          }
+          case None => t.setSecurityLevel(SecurityLevel.NOAUTH_NOPRIV)
+        }
+        username.foreach(v => t.setSecurityName(new OctetString(v)))
+        t
+    }
     target.setAddress(addr)
     target.setRetries(retries)
     target.setTimeout(timeout)
     target.setVersion(version.enum)
     target
   }
+
+  lazy val localEngineID = new OctetString(MPv3.createLocalEngineID());
+}
+
+object SnmpParams {
+  sealed trait Op
+  case object Read extends Op
+  case object Write extends Op
 }
 
 /**
@@ -123,14 +158,33 @@ case class SnmpParams(
   */
 class SnmpSync(params: SnmpParams) {
 
-  import params._;
+  import params.target
   private val map = new DefaultUdpTransportMapping
   private val snmp = new Snmp4j(map)
+  params.version match {
+    case Version3 =>
+      val usm = new USM(SecurityProtocols.getInstance(),
+        params.localEngineID, 0)
+      SecurityModels.getInstance().addSecurityModel(usm)
+      params.username.map(s2os).foreach { u =>
+        snmp.getUSM.addUser(u, new UsmUser(u,
+          params.authProtocol.orNull, params.authPass.map(s2os).orNull,
+          params.privProtocol.orNull, params.privPass.map(s2os).orNull));
+      }
+    case _ => // noop
+  }
   map.listen()
 
   protected implicit def Oid2Snmp4j(o: Oid): OID = new OID(o.toArray)
 
   protected implicit def Snmp4j2Oid(o: OID): Oid = o.getValue()
+
+  protected def s2os(s: String): OctetString = new OctetString(s)
+
+  protected def createPdu: PDU = params.version match {
+    case Version3 => new ScopedPDU
+    case _ => new PDU
+  }
 
   def get[T](req: GetRequest[T]) = {
     def pack[U](req: GetRequest[U]): (PDU => PDU) =
@@ -168,11 +222,11 @@ class SnmpSync(params: SnmpParams) {
 
   protected def doGet[R](pack: (PDU => PDU), unpack: (Seq[Either[SnmpError, Variable]]) => R): Either[SnmpError, R] = {
     try {
-      val pdu = new PDU
+      val pdu = createPdu
       pdu.setType(PDU.GET)
       pack(pdu)
 
-      val event = snmp.get(pdu, target(read))
+      val event = snmp.get(pdu, target(Read))
       val res = Option(event.getResponse)
 
       res match {
@@ -221,11 +275,11 @@ class SnmpSync(params: SnmpParams) {
 
   protected def doSet(pack: (PDU => PDU)): Option[SnmpError] = {
     try {
-      val pdu = new PDU
+      val pdu = createPdu
       pdu.setType(PDU.SET)
       pack(pdu)
 
-      val event = snmp.set(pdu, target(write))
+      val event = snmp.set(pdu, target(Write))
       val res = Option(event.getResponse)
 
       res match {
@@ -247,7 +301,7 @@ class SnmpSync(params: SnmpParams) {
     */
   def walk[A <: Readable, T](obj: AccessibleObject[A, T], ver: Version = Version1): Either[SnmpError, Seq[VarBind[A, T]]] = {
     try {
-      val events = (new TreeUtils(snmp, new DefaultPDUFactory(PDU.GETNEXT))).walk(target(read), Array(obj.oid))
+      val events = (new TreeUtils(snmp, new DefaultPDUFactory(PDU.GETNEXT))).walk(target(Read), Array(obj.oid))
 
       if (events.find(e => e.getVariableBindings() == null).isDefined) {
         Left(AgentUnreachable)
